@@ -60,6 +60,9 @@ static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+// forapi: Only allow registered (logged-in) clients. 开启后 PunchHole 携带的
+// token 会被校验，未登录客户端无法以该服务器作为中继/打洞服务器。
+static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -115,6 +118,27 @@ impl RendezvousServer {
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
+        // forapi: --must-login=[Y|N] 或 env MUST_LOGIN=Y 启用登录强制校验。
+        {
+            let must_login = get_arg("must-login");
+            if must_login.to_uppercase() == "Y"
+                || (must_login == ""
+                    && std::env::var("MUST_LOGIN")
+                        .unwrap_or_default()
+                        .to_uppercase()
+                        == "Y")
+            {
+                MUST_LOGIN.store(true, Ordering::SeqCst);
+            }
+            log::debug!(
+                "MUST_LOGIN={}",
+                if MUST_LOGIN.load(Ordering::SeqCst) {
+                    "true"
+                } else {
+                    "false"
+                }
+            );
+        }
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
@@ -717,6 +741,29 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
+        // forapi: 登录强制校验。MUST_LOGIN 开启后，PunchHole 必须携带有效 JWT
+        //（由 rustdesk-api 登录签发，与 SECRET 同源），否则拒绝打洞/中继请求。
+        if MUST_LOGIN.load(Ordering::SeqCst) {
+            if ph.token.is_empty() {
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    other_failure: String::from("Connection failed, please login!"),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
+            } else if !crate::jwt::SECRET.is_empty() {
+                let token = ph.token;
+                if crate::jwt::verify_token(&token).is_err() {
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_punch_hole_response(PunchHoleResponse {
+                        //提示重新登录
+                        other_failure: String::from("Token error, please log out and log back in!"),
+                        ..Default::default()
+                    });
+                    return Ok((msg_out, None));
+                }
+            }
+        }
         let id = ph.id;
         // punch hole request from A, relay to B,
         // check if in same intranet first,
@@ -1100,6 +1147,17 @@ impl RendezvousServer {
                         "ALWAYS_USE_RELAY: {:?}",
                         ALWAYS_USE_RELAY.load(Ordering::SeqCst)
                     );
+                }
+            }
+            Some("must-login" | "ml") => {
+                if let Some(rs) = fds.next() {
+                    if rs.to_uppercase() == "Y" {
+                        MUST_LOGIN.store(true, Ordering::SeqCst);
+                    } else {
+                        MUST_LOGIN.store(false, Ordering::SeqCst);
+                    }
+                } else {
+                    let _ = writeln!(res, "MUST_LOGIN: {:?}", MUST_LOGIN.load(Ordering::SeqCst));
                 }
             }
             Some("test-geo" | "tg") => {
