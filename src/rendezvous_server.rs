@@ -1140,7 +1140,15 @@ impl RendezvousServer {
                     } else {
                         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
                     }
-                    self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
+                    // forapi bugfix: 上游这里一直是 `self.tx.send(Data::RelayServers0(rs.to_owned()))`——
+                    // 把 "Y"/"N"（always-use-relay 的取值）当成中继地址列表送去 parse_relay_servers，
+                    // 后者校验 "Y"/"N" 不是合法的 host:port 会把它们过滤掉，等效于把 relay-servers
+                    // 悄悄清空成 []。真机 2026-09-24 复现：保存 ALWAYS_USE_RELAY 后 hbbs 日志立刻打出
+                    // "relay-servers=[]"，已配置好的公网中继地址被覆盖，所有客户端连接随之失败。
+                    // 这个 bug 同样存在于官方 rustdesk-server 仓库（截至 af7d7f0），不是我们改出来的；
+                    // 上游 rustdesk-api-web 前端甚至专门写了段"always_use_relay 保存后自动重新保存
+                    // relay-servers 防止被重置"的补丁代码，就是在掩盖这个服务端 bug。这里直接删掉这行
+                    // 错误的 send，从根上修，配套去掉前端那段补丁式代码。
                 } else {
                     let _ = writeln!(
                         res,
@@ -1475,5 +1483,72 @@ mod tests {
         let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let socket = create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
+    }
+
+    // 每个测试用独立的 sqlite 文件：PeerMap::new() 靠 DB_URL 环境变量定位数据库，
+    // 这是进程级全局状态，测试并行跑会互相踩，所以每次都生成一个独立文件名。
+    async fn make_test_server(db_suffix: &str) -> (RendezvousServer, Sender, Receiver) {
+        let db = std::env::temp_dir().join(format!(
+            "hbbs-test-{}-{}.sqlite3",
+            db_suffix,
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("DB_URL", db.to_str().unwrap());
+        let (tx, rx) = mpsc::unbounded_channel::<Data>();
+        let server = RendezvousServer {
+            tcp_punch: Default::default(),
+            pm: PeerMap::new().await.unwrap(),
+            tx: tx.clone(),
+            relay_servers: Arc::new(vec!["ip.virson.cn:21117".to_owned()]),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Default::default(),
+            inner: Arc::new(Inner {
+                serial: 0,
+                version: String::new(),
+                software_url: String::new(),
+                mask: None,
+                local_ip: String::new(),
+                sk: None,
+            }),
+        };
+        (server, tx, rx)
+    }
+
+    // 回归测试：真机 2026-09-24 复现过两次——飞牛管理面板保存「ALWAYS_USE_RELAY」
+    // 开关后，hbbs 日志立刻打出 relay-servers=[]，公网中继地址被悄悄清空，
+    // 所有设备互连随即失败（Failed to secure tcp / deadline has elapsed 那一整轮
+    // 排查最后就是卡在这里）。根因：check_cmd 的 "aur" 分支把 "Y"/"N" 当成中继
+    // 地址列表送进了 Data::RelayServers0。本测试直接钉住 check_cmd 的可观察行为：
+    // 处理 "aur Y"/"aur N" 不应该产生任何 RelayServers0 消息。
+    #[hbb_common::tokio::test]
+    async fn always_use_relay_command_does_not_touch_relay_servers() {
+        let (server, _tx, mut rx) = make_test_server("aur").await;
+
+        let _ = server.check_cmd("aur Y").await;
+        assert!(
+            rx.try_recv().is_err(),
+            "保存 ALWAYS_USE_RELAY=Y 不应该顺带发出 RelayServers0 消息，那会把中继地址清空"
+        );
+        assert!(ALWAYS_USE_RELAY.load(Ordering::SeqCst), "aur Y 应该把开关设为开启");
+
+        let _ = server.check_cmd("aur N").await;
+        assert!(
+            rx.try_recv().is_err(),
+            "保存 ALWAYS_USE_RELAY=N 同样不应该发出 RelayServers0 消息"
+        );
+        assert!(!ALWAYS_USE_RELAY.load(Ordering::SeqCst), "aur N 应该把开关设为关闭");
+    }
+
+    // 对照组：真正的 "rs"/"relay-servers" 命令必须继续正常工作——上面那个修复
+    // 删的是 "aur" 分支里错误多发的那一条 send，不能连带把真正的设置能力也删掉。
+    #[hbb_common::tokio::test]
+    async fn relay_servers_command_still_updates_the_list() {
+        let (server, _tx, mut rx) = make_test_server("rs").await;
+
+        let _ = server.check_cmd("rs example.com:21117").await;
+        match rx.try_recv() {
+            Ok(Data::RelayServers0(v)) => assert_eq!(v, "example.com:21117"),
+            other => panic!("期望收到 RelayServers0(\"example.com:21117\")，got {other:?}"),
+        }
     }
 }
