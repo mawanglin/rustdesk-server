@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -50,9 +50,19 @@ enum Data {
 const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
-enum Sink {
+// secure_tcp/KeyExchange 握手完成前是 None（明文透传，兼容不认识这个握手的旧客户端）；
+// 握手完成后变成 Some，这条连接上以后收发的每一帧都要在这里加解密。跟着 Sink 一起
+// 被塞进 tcp_punch（见 handle_tcp 里 PunchHoleRequest/RequestRelay 分支），保证从
+// 别的任务异步推送给这条连接的消息（比如打洞响应）也会被加密。WS 连接永远是 None：
+// wss 自身已经有传输层加密，客户端 use_ws() 会直接跳过整个握手。
+type EncState = Arc<Mutex<Option<Encrypt>>>;
+enum SinkInner {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
+}
+struct Sink {
+    inner: SinkInner,
+    enc: EncState,
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -532,9 +542,39 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        enc: &EncState,
+        eph_sk: &Option<box_::SecretKey>,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
+                Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                    // secure_tcp 握手第二帧：ex.keys = [客户端临时公钥, 封好的对称密钥]。
+                    // 只有我们主动发过第一帧（eph_sk 有值）且还没完成握手时才处理；
+                    // 不认识 KeyExchange 这个消息类型的旧客户端根本不会回这一帧，
+                    // 这条分支对它们完全透明，连接照旧走明文。
+                    if enc.lock().await.is_none() {
+                        if let Some(eph_sk) = eph_sk.as_ref() {
+                            if ex.keys.len() == 2 {
+                                match Encrypt::decode(&ex.keys[1], &ex.keys[0], eph_sk) {
+                                    Ok(key) => {
+                                        *enc.lock().await = Some(Encrypt::new(key));
+                                        log::debug!("Secured tcp connection from {:?}", addr);
+                                    }
+                                    Err(err) => {
+                                        log::warn!(
+                                            "Key exchange from {:?} failed: {}",
+                                            addr,
+                                            err
+                                        );
+                                    }
+                                }
+                            } else {
+                                log::warn!("Invalid key exchange message from {:?}", addr);
+                            }
+                        }
+                    }
+                    return true;
+                }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
@@ -898,11 +938,16 @@ impl RendezvousServer {
     async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
-                match sink {
-                    Sink::TcpStream(s) => {
+                let bytes = if let Some(enc) = sink.enc.lock().await.as_mut() {
+                    enc.enc(&bytes)
+                } else {
+                    bytes
+                };
+                match &mut sink.inner {
+                    SinkInner::TcpStream(s) => {
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
-                    Sink::Ws(ws) => {
+                    SinkInner::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
                     }
                 }
@@ -1244,6 +1289,7 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
+        let enc_state: EncState = Arc::new(Mutex::new(None));
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1272,19 +1318,57 @@ impl RendezvousServer {
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Ws(a));
+            sink = Some(Sink {
+                inner: SinkInner::Ws(a),
+                enc: enc_state.clone(),
+            });
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self
+                        .handle_tcp(&bytes, &mut sink, addr, key, ws, &enc_state, &None)
+                        .await
+                    {
                         break;
                     }
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+            let (mut a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            // secure_tcp 握手：新连接一建立就主动发第一帧——用服务端长期签名私钥对一个
+            // 一次性 X25519 公钥签名。1.4.x 及以后的客户端会在读到这条消息前什么都不发、
+            // 原地等着（等不到就是真机复现过的 "Failed to secure tcp: deadline has
+            // elapsed"），收到后回一帧带着它自己的临时公钥+封好的对称密钥；不认识这个
+            // 消息类型的旧客户端会直接忽略，继续等它自己要的第一帧，行为不受影响。
+            // 没有配置/生成签名私钥（self.inner.sk 为 None）时跳过，保持原有明文行为。
+            let eph_sk = if let Some(sk) = self.inner.sk.as_ref() {
+                let (eph_pk, eph_sk) = box_::gen_keypair();
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_key_exchange(KeyExchange {
+                    keys: vec![sign::sign(&eph_pk.0, sk).into()],
+                    ..Default::default()
+                });
+                if let Ok(bytes) = msg_out.write_to_bytes() {
+                    allow_err!(timeout(3_000, a.send(Bytes::from(bytes))).await);
+                }
+                Some(eph_sk)
+            } else {
+                None
+            };
+            sink = Some(Sink {
+                inner: SinkInner::TcpStream(a),
+                enc: enc_state.clone(),
+            });
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(enc) = enc_state.lock().await.as_mut() {
+                    if enc.dec(&mut bytes).is_err() {
+                        log::warn!("Failed to decrypt tcp message from {:?}", addr);
+                        break;
+                    }
+                }
+                if !self
+                    .handle_tcp(&bytes, &mut sink, addr, key, ws, &enc_state, &eph_sk)
+                    .await
+                {
                     break;
                 }
             }
@@ -1477,6 +1561,7 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sodiumoxide::crypto::secretbox;
 
     #[hbb_common::tokio::test]
     async fn udp_listener_uses_bind_address() {
@@ -1488,6 +1573,13 @@ mod tests {
     // 每个测试用独立的 sqlite 文件：PeerMap::new() 靠 DB_URL 环境变量定位数据库，
     // 这是进程级全局状态，测试并行跑会互相踩，所以每次都生成一个独立文件名。
     async fn make_test_server(db_suffix: &str) -> (RendezvousServer, Sender, Receiver) {
+        make_test_server_with_sk(db_suffix, None).await
+    }
+
+    async fn make_test_server_with_sk(
+        db_suffix: &str,
+        sk: Option<sign::SecretKey>,
+    ) -> (RendezvousServer, Sender, Receiver) {
         let db = std::env::temp_dir().join(format!(
             "hbbs-test-{}-{}.sqlite3",
             db_suffix,
@@ -1508,7 +1600,7 @@ mod tests {
                 software_url: String::new(),
                 mask: None,
                 local_ip: String::new(),
-                sk: None,
+                sk,
             }),
         };
         (server, tx, rx)
@@ -1550,5 +1642,135 @@ mod tests {
             Ok(Data::RelayServers0(v)) => assert_eq!(v, "example.com:21117"),
             other => panic!("期望收到 RelayServers0(\"example.com:21117\")，got {other:?}"),
         }
+    }
+
+    // secure_tcp/KeyExchange 握手：真机 2026-09-24 复现的 "Failed to secure tcp:
+    // deadline has elapsed" 报错——客户端登录后开的那条 TCP 连接会原地等服务端主动
+    // 发一条 KeyExchange，hbbs 以前从来不发，等到超时。这里在真实的 loopback TCP
+    // 连接上完整走一遍协议，协议细节照抄 rustdesk 客户端 1.4.9（hbb_common@7e1c392）
+    // 的 secure_tcp_impl/create_symmetric_key_msg，确认握手后双向流量真的被加密、
+    // 而且服务端能正常处理加密后的业务消息（不是只握手不干活）。
+    #[hbb_common::tokio::test]
+    async fn secure_tcp_handshake_encrypts_traffic() {
+        let (server_pk, server_sk) = sign::gen_keypair();
+        let (server, _tx, _rx) = make_test_server_with_sk("kx-ok", Some(server_sk)).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let mut server = server.clone();
+            server
+                .handle_listener_inner(stream, addr, "", false)
+                .await
+                .ok();
+        });
+
+        let client_stream = TcpStream::connect(listen_addr).await.unwrap();
+        let mut client = Framed::new(client_stream, hbb_common::bytes_codec::BytesCodec::new());
+
+        // 第一帧：服务端主动发来的 KeyExchange(用长期签名私钥签过的一次性公钥)
+        let bytes = client.next().await.unwrap().unwrap();
+        let their_pk_b = match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
+            Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                assert_eq!(ex.keys.len(), 1, "服务端第一帧应该只带一个签名后的临时公钥");
+                sign::verify(&ex.keys[0], &server_pk)
+                    .expect("服务端签名必须能用它对外公开的公钥验证通过")
+            }
+            other => panic!("期望第一帧是 KeyExchange，got {other:?}"),
+        };
+        assert_eq!(their_pk_b.len(), 32, "服务端临时公钥必须是 32 字节的 X25519 公钥");
+        let mut their_pk_arr = [0u8; 32];
+        their_pk_arr.copy_from_slice(&their_pk_b);
+        let their_pk = box_::PublicKey(their_pk_arr);
+
+        // 第二帧：客户端视角的握手回复，跟 rustdesk 客户端的 create_symmetric_key_msg
+        // 生成方式完全一致——自己的临时公钥 + 用服务端临时公钥封好的对称密钥。
+        let (our_pk, our_sk) = box_::gen_keypair();
+        let sym_key = secretbox::gen_key();
+        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+        let sealed_key = box_::seal(&sym_key.0, &nonce, &their_pk, &our_sk);
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_key_exchange(KeyExchange {
+            keys: vec![Vec::from(our_pk.0).into(), sealed_key.into()],
+            ..Default::default()
+        });
+        client
+            .send(Bytes::from(msg_out.write_to_bytes().unwrap()))
+            .await
+            .unwrap();
+
+        // 握手完成后，发一条加密的 TestNatRequest，期待服务端能解密、处理，并且
+        // 回复也是用同一把对称密钥加密的（不是握手完就不管后续流量了）。
+        let mut enc = Encrypt::new(sym_key);
+        let mut req = RendezvousMessage::new();
+        req.set_test_nat_request(TestNatRequest::default());
+        let sealed_req = enc.enc(&req.write_to_bytes().unwrap());
+        client.send(Bytes::from(sealed_req)).await.unwrap();
+
+        let mut resp_bytes = client.next().await.unwrap().unwrap();
+        enc.dec(&mut resp_bytes)
+            .expect("服务端的回复必须能用同一把握手协商出的对称密钥解开");
+        match RendezvousMessage::parse_from_bytes(&resp_bytes).unwrap().union {
+            Some(rendezvous_message::Union::TestNatResponse(_)) => {}
+            other => panic!("期望解密后是 TestNatResponse，got {other:?}"),
+        }
+
+        drop(client);
+        server_task.await.ok();
+    }
+
+    // 兼容性回归：不认识 KeyExchange 这个消息类型的旧客户端，连接一建立就直接发
+    // 自己的请求、完全不等服务端先说话。服务端现在会抢先发一帧 KeyExchange，这里
+    // 确认旧客户端"读到不认识的消息类型就忽略、继续读下一帧"的老行为下，仍然能
+    // 收到自己真正要的那条明文回复——新握手不能破坏没有实现它的旧客户端。
+    #[hbb_common::tokio::test]
+    async fn unrecognized_key_exchange_is_ignored_by_legacy_client_flow() {
+        let (_server_pk, server_sk) = sign::gen_keypair();
+        let (server, _tx, _rx) = make_test_server_with_sk("kx-legacy", Some(server_sk)).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let mut server = server.clone();
+            server
+                .handle_listener_inner(stream, addr, "", false)
+                .await
+                .ok();
+        });
+
+        let client_stream = TcpStream::connect(listen_addr).await.unwrap();
+        let mut client = Framed::new(client_stream, hbb_common::bytes_codec::BytesCodec::new());
+
+        // 旧客户端的做法：不读服务端先发的东西，直接把自己的请求发出去。
+        let mut req = RendezvousMessage::new();
+        req.set_punch_hole_request(PunchHoleRequest {
+            id: "does-not-exist".to_owned(),
+            ..Default::default()
+        });
+        client
+            .send(Bytes::from(req.write_to_bytes().unwrap()))
+            .await
+            .unwrap();
+
+        // 第一帧是服务端抢发的 KeyExchange——旧客户端的 match 里没有这个分支，
+        // 落到 `_ => {}`，直接丢掉，接着读下一帧。
+        let first = client.next().await.unwrap().unwrap();
+        match RendezvousMessage::parse_from_bytes(&first).unwrap().union {
+            Some(rendezvous_message::Union::KeyExchange(_)) => {}
+            other => panic!("期望第一帧是服务端抢发的 KeyExchange，got {other:?}"),
+        }
+
+        // 第二帧才是真正对 PunchHoleRequest 的回复，而且必须是明文——旧客户端
+        // 完全没有做握手，服务端不能强制加密它看不懂的连接。
+        let second = client.next().await.unwrap().unwrap();
+        match RendezvousMessage::parse_from_bytes(&second).unwrap().union {
+            Some(rendezvous_message::Union::PunchHoleResponse(_)) => {}
+            other => panic!("期望第二帧是明文 PunchHoleResponse，got {other:?}"),
+        }
+
+        drop(client);
+        server_task.await.ok();
     }
 }
