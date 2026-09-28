@@ -1341,7 +1341,7 @@ impl RendezvousServer {
             // 消息类型的旧客户端会直接忽略，继续等它自己要的第一帧，行为不受影响。
             // 没有配置/生成签名私钥（self.inner.sk 为 None）时跳过，保持原有明文行为。
             let eph_sk = if let Some(sk) = self.inner.sk.as_ref() {
-                let (eph_pk, eph_sk) = box_::gen_keypair();
+                let (eph_pk, eph_sk) = gen_kx_keypair();
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_key_exchange(KeyExchange {
                     keys: vec![sign::sign(&eph_pk.0, sk).into()],
@@ -1558,6 +1558,23 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
     Ok(s)
 }
 
+// secure_tcp 握手用的一次性 X25519 keypair。RustDesk 1.5.0（预发布，2026-09-25
+// 发布）给 KeyExchange 加了版本协商（KxParams/signed_params）：客户端只有在临时
+// 公钥最后一个字节最高位为 1 时才会要求这套新字段（我们的 KeyExchange.version/
+// signed_params 留空，等同旧方案）；1.4.x 完全不看这一位。这里把这一位筛掉
+// （X25519 本来就不用这一位参与运算，安全性不受影响），保证不管对面是 1.4.x 还是
+// 1.5.0 都走同一条"原始方案"路径，不用为了兼容 1.5.0 去实现整套版本化握手。不这样
+// 做的话，一旦对面是 1.5.0 客户端，大约一半的连接（取决于随机生成的临时公钥）会在
+// 握手时报 "Missing or invalid signed key exchange parameters" 而失败。
+fn gen_kx_keypair() -> (box_::PublicKey, box_::SecretKey) {
+    loop {
+        let (pk, sk) = box_::gen_keypair();
+        if pk.0[31] & 0x80 == 0 {
+            return (pk, sk);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1682,6 +1699,11 @@ mod tests {
         assert_eq!(their_pk_b.len(), 32, "服务端临时公钥必须是 32 字节的 X25519 公钥");
         let mut their_pk_arr = [0u8; 32];
         their_pk_arr.copy_from_slice(&their_pk_b);
+        assert_eq!(
+            their_pk_arr[31] & 0x80,
+            0,
+            "临时公钥最后一字节最高位必须是 0，否则 RustDesk 1.5.0 客户端会因为缺 signed_params 而握手失败"
+        );
         let their_pk = box_::PublicKey(their_pk_arr);
 
         // 第二帧：客户端视角的握手回复，跟 rustdesk 客户端的 create_symmetric_key_msg
@@ -1772,5 +1794,22 @@ mod tests {
 
         drop(client);
         server_task.await.ok();
+    }
+
+    // 回归测试：RustDesk 1.5.0（预发布，2026-09-25 发布）给 KeyExchange 加了版本协商，
+    // 客户端只有在临时公钥最后一字节最高位为 1 时才会要求我们没实现的 signed_params
+    // 字段——不筛掉这一位的话，大约一半的连接会在 1.5.0 客户端那边握手失败。box_
+    // 每次都随机生成，单次断言只有 50% 概率能抓到回归；这里跑 256 次把漏检概率
+    // 压到可忽略不计。
+    #[hbb_common::tokio::test]
+    async fn kx_keypair_never_sets_the_kxparams_high_bit() {
+        for _ in 0..256 {
+            let (pk, _sk) = gen_kx_keypair();
+            assert_eq!(
+                pk.0[31] & 0x80,
+                0,
+                "gen_kx_keypair 生成的临时公钥不应该设置这一位，否则 1.5.0 客户端握手会失败"
+            );
+        }
     }
 }
